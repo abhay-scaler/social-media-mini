@@ -10,6 +10,32 @@ const app = express();
 app.set('trust proxy', 1); // Trust first proxy
 app.use(cors());
 
+// Strip the internal service token from every inbound request, before any
+// route or proxy can see it.
+//
+// INTERNAL_SERVICE_TOKEN authenticates the auth-service -> user-service call
+// made directly across the Docker network during registration; it never
+// legitimately travels through this gateway. A client presenting one is
+// confused or probing, and must not have it forwarded: POST /sync-user accepts
+// a whole profile -- _id, email and a pre-hashed password -- so a leaked token
+// that survived this hop would be replayable from the public internet.
+//
+// Done once here rather than inside each proxy's options so that a route added
+// later cannot silently reopen the hole. That is exactly how it was open
+// before: the removal lived only in a per-route callback that never ran (see
+// the note on `on` below).
+const INTERNAL_TOKEN_HEADER = 'x-internal-token';
+app.use((req, _res, next) => {
+  // Node lowercases inbound header names, but sweep case-insensitively so this
+  // does not depend on that detail.
+  for (const name of Object.keys(req.headers)) {
+    if (name.toLowerCase() === INTERNAL_TOKEN_HEADER) {
+      delete req.headers[name];
+    }
+  }
+  next();
+});
+
 // Global rate limiter
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -54,7 +80,32 @@ app.get("/api/health/all", async (req, res) => {
   res.status(allHealthy ? 200 : 503).json({ services, overall: allHealthy ? "healthy" : "degraded" });
 });
 
+// `timeout` and `proxyTimeout` are not interchangeable, and the difference is
+// the whole behaviour here. http-proxy applies `timeout` to the INCOMING
+// client socket (web-incoming.js: `req.socket.setTimeout`) and registers no
+// handler, so when it fires the connection is dropped with no HTTP response at
+// all. `proxyTimeout` applies to the OUTGOING request
+// (`proxyReq.setTimeout(..., () => proxyReq.abort())`), which surfaces as a
+// proxy error and reaches the handler below as the documented 503.
+//
+// This gateway previously set only `timeout`, so a hung upstream produced an
+// empty reply, not a 503. Measured against an upstream that accepts the
+// connection and never answers: `timeout` alone gives no response; a
+// `proxyTimeout` strictly shorter than the client timeout gives 503.
+//
+// They must not be equal -- with both at the same value the socket drop wins
+// the race -- hence the deliberate gap.
+const PROXY_TIMEOUT_MS = Number(process.env.PROXY_TIMEOUT_MS) || 30000;
+const CLIENT_TIMEOUT_MS = PROXY_TIMEOUT_MS + 5000;
+
 // Proxy routes
+//
+// http-proxy-middleware v3 moved every proxy callback under `on`. The old
+// top-level `onProxyReq` / `onError` / `logLevel` keys are only honoured by the
+// separate `legacyCreateProxyMiddleware` export; `createProxyMiddleware`
+// ignores unrecognised options **silently** -- no warning, no error. Anything
+// registered the old way simply never runs, which is how the x-internal-token
+// removal below came to be dead code.
 const proxyOptions = {
   changeOrigin: true,
   pathRewrite: (path, req) => {
@@ -62,46 +113,56 @@ const proxyOptions = {
     // e.g., /api/auth/register -> /register
     return path.replace(/^\/api\/[^\/]+/, '');
   },
-  onProxyReq: (proxyReq, req, res) => {
-    // The internal service token authenticates service-to-service calls that
-    // never traverse this gateway. A client presenting one is either confused
-    // or probing, so drop it before forwarding -- a leaked token then still
-    // cannot be replayed from outside the Docker network.
-    proxyReq.removeHeader('x-internal-token');
-    // Forward authorization header
-    if (req.headers.authorization) {
-      proxyReq.setHeader('authorization', req.headers.authorization);
-    }
+  on: {
+    proxyReq: (proxyReq, req, res) => {
+      // Second, independent removal: the middleware above already deleted the
+      // header from req.headers, so this covers the outgoing request even if
+      // something re-added it. removeHeader is case-insensitive.
+      proxyReq.removeHeader(INTERNAL_TOKEN_HEADER);
+      // Forward authorization header
+      if (req.headers.authorization) {
+        proxyReq.setHeader('authorization', req.headers.authorization);
+      }
+    },
+    error: (err, req, res) => {
+      console.error('Proxy Error:', err.message);
+      // On a websocket upgrade failure the second argument is a net.Socket,
+      // which has no status()/json().
+      if (typeof res?.status !== 'function') {
+        res?.destroy?.();
+        return;
+      }
+      if (res.headersSent) {
+        return;
+      }
+      // err.message carries the upstream host and port (e.g.
+      // "connect ECONNREFUSED 172.18.0.5:3002"). Log it, never return it.
+      res.status(503).json({ message: 'Service temporarily unavailable' });
+    },
   },
-  onError: (err, req, res) => {
-    console.error('Proxy Error:', err.message);
-    res.status(503).json({ 
-      message: 'Service temporarily unavailable',
-      error: err.message 
-    });
-  },
-  timeout: 30000
+  // Bounds the upstream response and yields a 503; see the note above.
+  proxyTimeout: PROXY_TIMEOUT_MS,
+  // Backstop on the client socket, deliberately longer so it never pre-empts
+  // the 503.
+  timeout: CLIENT_TIMEOUT_MS
 };
 
 // Auth service routes
 app.use('/api/auth', createProxyMiddleware({
   ...proxyOptions,
-  target: process.env.AUTH_SERVICE_URL,
-  logLevel: 'debug'
+  target: process.env.AUTH_SERVICE_URL
 }));
 
 // User service routes
 app.use('/api/users', createProxyMiddleware({
   ...proxyOptions,
-  target: process.env.USER_SERVICE_URL,
-  logLevel: 'debug'
+  target: process.env.USER_SERVICE_URL
 }));
 
 // Post service routes
 app.use('/api/posts', createProxyMiddleware({
   ...proxyOptions,
-  target: process.env.POST_SERVICE_URL,
-  logLevel: 'debug'
+  target: process.env.POST_SERVICE_URL
 }));
 
 // 404 handler - must be last

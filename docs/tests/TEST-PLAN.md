@@ -140,14 +140,17 @@ measured, not estimated.
 
 | Location | Command source | Suites | Measured result |
 | --- | --- | --- | --- |
-| `services/auth-service` | `package.json` `test` | `auth.test.js` | **18 pass** |
-| `services/user-service` | `package.json` `test` | `user.test.js`, `imageType.test.js` | **27 pass** |
-| `services/post-service` | `package.json` `test` | `post.test.js`, `imageType.test.js` | **35 pass** |
-| `services/api-gateway` | — | none | **no `test` script** |
+| `services/auth-service` | `package.json` `test` | `auth.test.js` (18) | **18 pass** |
+| `services/user-service` | `package.json` `test` | `user.test.js` (10), `imageType.test.js` (17), `imageReference.test.js` (16), `internalAuth.test.js` (21) | **64 pass** |
+| `services/post-service` | `package.json` `test` | `post.test.js` (18), `imageType.test.js` (17), `imageReference.test.js` (16) | **51 pass** |
+| `services/api-gateway` | `package.json` `test` (`node --test`) | `gateway.test.js` (17) | **17 pass** |
 | `social-media-mini-frontend` | `package.json` | none | **no test tooling at all** |
+| repository root | `scripts/e2e-registration.sh` | the registration saga against a running stack | **34 checks**, stack required |
 
-**80 tracked tests.** Of those, the `imageType.test.js` pair (17 per service) is
-the only part importing a production module — see §2.3 and C1 in §30.
+**150 tracked tests**, plus the 34 stack-level checks in
+`scripts/e2e-registration.sh`. Of the 133, the 87 in `imageType.test.js` ×2,
+`imageReference.test.js` ×2 and `internalAuth.test.js` import a production
+module; the other 46 run against replica apps — see §2.3 and C1 in §30.
 
 What that pair actually asserts, since it is the repository's only real
 coverage of shipped code: `detectImageType` accepts **JPEG, PNG, GIF87a,
@@ -200,8 +203,21 @@ required because the services are ES modules; `transform: {}` in each
 `package.json` `jest` block disables Babel for the same reason, and
 `testTimeout` is **30000 ms**.
 
-Measured wall-clock on Node 22: auth-service ~13 s (`auth.test.js` alone),
-user-service ~9 s, post-service ~7 s.
+Measured wall-clock on Node 22: auth-service ~15 s (`auth.test.js` alone),
+user-service ~12 s, post-service ~12 s.
+
+The saga checks need a running stack rather than `mongodb-memory-server`, so
+they are a separate command:
+
+```bash
+docker compose -f docker-compose.microservices.yml up -d --wait
+INTERNAL_SERVICE_TOKEN=<the value the stack was started with> \
+  ./scripts/e2e-registration.sh
+```
+
+It requires `curl`, `python3` and the Compose plugin, prints no token value,
+and restores user-service on every exit path — including a failure part-way
+through the rollback check, which deliberately stops that container.
 
 ### 0.4 Coverage reporting
 
@@ -226,9 +242,13 @@ is a three-way matrix (`auth-service`, `post-service`, `user-service`) with
 `npm test`. **It does not run coverage**, so no coverage gate is enforced today
 regardless of what §22 targets.
 
-`api-gateway` has no suite, so its job runs `node --check server.js` plus a real
-boot with liveness verification. `frontend` runs ESLint, a production build and
+`api-gateway` runs `npm test` (Node's built-in runner, no added dependency),
+then `node --check server.js` plus a real boot with liveness verification. `frontend` runs ESLint, a production build and
 a bundle secret scan — no tests, because none exist.
+
+`stack-integration` additionally runs `scripts/e2e-registration.sh` after the
+health probes, which is the only CI step that exercises application behaviour
+against the real containers rather than a replica app or an in-memory database.
 
 ### 0.6 Troubleshooting
 
@@ -525,11 +545,12 @@ That layer is fast (seconds), hermetic, and tests shipped code.
 
 | Layer | Tests | Tests *shipped* code? |
 | --- | --- | --- |
-| Unit | 34 (`imageType` ×2) | ✅ yes |
+| Unit | 87 (`imageType` ×2 = 34, `imageReference` ×2 = 32, `internalAuth` 21) | ✅ yes |
 | Service API | 46 (auth 18, user 10, post 18) | ❌ **no — replica apps** |
-| Integration | 1 file, untracked, failing | n/a |
+| Gateway proxy | 15 (`gateway.test.js`) | ✅ yes — the real `server.js` |
+| Cross-service integration | 34 checks (`scripts/e2e-registration.sh`, stack job) | ✅ yes — the real containers |
 | Contract | 0 | — |
-| E2E | 0 | — |
+| Browser E2E | 0 | — |
 | Production smoke | 0 | — |
 
 ---
@@ -555,9 +576,9 @@ graph TD
 
 **L0 — Static analysis & security**
 *Purpose:* catch defects without executing the product.
-*Scope:* ESLint on the frontend; `scripts/ci-security-checks.sh` (23 assertions
-covering regression patterns and committed secrets); CodeQL; `npm ci` lockfile
-reproducibility.
+*Scope:* ESLint on the frontend; `scripts/ci-security-checks.sh` (32 assertions
+covering regression patterns, required hardening, and committed secrets);
+CodeQL; `npm ci` lockfile reproducibility.
 *Mocked:* nothing. *Real infra:* none. *Speed:* seconds.
 *Frequency:* every push. *CI stage:* `security-checks`, `frontend`.
 *Owner:* whoever opens the PR. *Gate:* **blocking.**
@@ -611,8 +632,10 @@ eviction; Mongo unique-index violation on duplicate `email`.
 
 **L6 — Cross-service integration**
 *Purpose:* verify the trust and data flows between services.
-*Scope:* the registration→sync saga and its rollback; `protect` against a live
-auth-service; the `PUT /me` → `posts:feed:global` invalidation.
+*Scope:* **implemented** for the registration→sync saga, its internal service
+boundary and its rollback — `scripts/e2e-registration.sh`, 34 checks, run by
+the `stack-integration` job. **Still open:** `protect` against a live
+auth-service, and the `PUT /me` → `posts:feed:global` invalidation.
 *Real infra:* the full Compose stack.
 *Speed:* minutes including stack boot. *CI stage:* `stack-integration`.
 *Owner:* platform/QA jointly. *Gate:* blocking on `main`.
@@ -827,28 +850,45 @@ limiting, health aggregation.
 **Dependencies.** The three services by URL. No database, no cache.
 
 **Verified behaviour.** Strips `/api/<service>`; forwards the `Authorization`
-header explicitly; returns 503 `Service temporarily unavailable` on proxy
-error; 30s proxy timeout; global limiter 100/15min; a catch-all 404 handler.
-Requires the three service URLs at module scope or it throws on boot.
+header; deletes any client-supplied `x-internal-token` before routing, then
+again on the outgoing request; returns 503 `Service temporarily unavailable` on
+proxy error; a 30s upstream deadline (`proxyTimeout`, overridable with
+`PROXY_TIMEOUT_MS`) with the client-socket backstop deliberately 5s longer;
+global limiter 100/15min; a catch-all 404
+handler. Requires the three service URLs at module scope or it throws on boot.
 
-**Test strategy.** No unit tests — it has no logic of its own. The valuable
-tests are:
-- **Routing correctness:** assert `/api/auth/x` → auth-service `/x`, for all
-  three prefixes, including a path with a query string and a nested path.
+**Test strategy.** No unit tests — it has no logic of its own. `gateway.test.js`
+(17 tests, Node's built-in runner, no added dependency) starts the real
+`server.js` in front of stub upstreams and asserts what those upstreams
+receive. Covered today:
+- **Routing correctness:** `/api/<service>/x` → upstream `/x`, on the auth and
+  users prefixes.
 - **Header forwarding:** `Authorization` survives the hop.
-- **Error contract:** a downed service yields 503 with the documented body, not
-  a hang or a 502.
-- **Rate limiting:** the 101st request in the window returns 429.
-- **Health aggregation:** 200 when all healthy, 503 when one is down.
+- **Internal-token stripping:** a client-supplied `x-internal-token` never
+  reaches an upstream, in any capitalisation or duplicated, on every proxy
+  route — and the attempt creates no profile.
+- **Error contract:** a refused upstream yields the documented JSON 503, with
+  no upstream host, port or error code in the body.
+- **Timeout contract:** an upstream that accepts the connection and never
+  answers also yields the 503, at roughly the proxy deadline rather than the
+  client backstop. Run against a gateway started with a short
+  `PROXY_TIMEOUT_MS`, so the assertion costs about a second.
 
-Best implemented as **cross-service integration tests against the real stack**,
-or in-process with `nock`-style HTTP interception once the app is exported. CI
-currently only verifies that the module boots — honest, but thin.
+Still open: **rate limiting** (the 101st request in the window returns 429) and
+**health aggregation** (200 when all healthy, 503 when one is down); a query
+string and a deeper nested path are untested on the routing side.
 
-**Risk.** It has **no test suite at all** and no `test` script. Its CI job runs
-`node --check` plus a real boot with liveness verification. That catches syntax
-and import errors, not routing regressions. A path-rewrite regex change could
-break every route in the system and CI would pass.
+**Why against a running process.** The header removal was once registered as
+`onProxyReq`, an option `createProxyMiddleware` ignores silently in
+http-proxy-middleware v3, so it never executed. A test invoking the callback
+directly — or asserting `removeHeader` appears in the source — passes against
+that build. Only the upstream's own view of the request catches it. See
+Appendix A.
+
+**Residual risk.** A path-rewrite regex change is now caught for two prefixes,
+but the posts prefix is exercised only through the error path, and the
+`stack-integration` job remains the only check on the real nginx → gateway →
+service chain.
 
 ### 4.5 frontend
 
