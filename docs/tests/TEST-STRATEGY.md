@@ -158,7 +158,7 @@ is cancelled, so a skipped job cannot read as green:
 | Lockfile reproducibility | `git diff --exit-code` clean after `npm ci` — four assertions: the three-service matrix, `api-gateway`, the frontend, and the root scripts package |
 | Frontend ESLint + production build | 0 errors, build succeeds |
 | Frontend bundle secret scan | no backend secret in `dist/` |
-| `api-gateway` proxy behaviour | 15 tests against the real `server.js` in front of stub upstreams: the internal token never reaches an upstream, `Authorization` does, prefixes are stripped, a downed upstream yields the documented JSON 503 |
+| `api-gateway` proxy behaviour | 17 tests against the real `server.js` in front of stub upstreams: the internal token never reaches an upstream, `Authorization` does, prefixes are stripped, and a refused *or hung* upstream yields the documented JSON 503 |
 | `api-gateway` module load | parses and boots with its proxy targets set |
 | Migration script check | parses and refuses to run unconfigured |
 | Compose files parse | `docker compose config` succeeds |

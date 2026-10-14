@@ -95,6 +95,27 @@ const makeUpstream = (name) =>
     });
   });
 
+const spawnGateway = (env) =>
+  spawn(process.execPath, ['server.js'], {
+    cwd: HERE,
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+const waitForHealth = async (port, ms = 20000) => {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/health`);
+      if (res.ok) return;
+    } catch {
+      /* not up yet */
+    }
+    if (Date.now() > deadline) throw new Error(`gateway on ${port} did not start`);
+    await new Promise((r) => setTimeout(r, 150));
+  }
+};
+
 let gateway;
 let gatewayPort;
 let userUpstream;
@@ -129,29 +150,13 @@ before(async () => {
   await listen(userUpstream, userPort);
   await listen(authUpstream, authPort);
 
-  gateway = spawn(process.execPath, ['server.js'], {
-    cwd: HERE,
-    env: {
-      ...process.env,
-      PORT: String(gatewayPort),
-      AUTH_SERVICE_URL: `http://127.0.0.1:${authPort}`,
-      USER_SERVICE_URL: `http://127.0.0.1:${userPort}`,
-      POST_SERVICE_URL: `http://127.0.0.1:${deadPort}`,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
+  gateway = spawnGateway({
+    PORT: String(gatewayPort),
+    AUTH_SERVICE_URL: `http://127.0.0.1:${authPort}`,
+    USER_SERVICE_URL: `http://127.0.0.1:${userPort}`,
+    POST_SERVICE_URL: `http://127.0.0.1:${deadPort}`,
   });
-
-  const deadline = Date.now() + 20000;
-  for (;;) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${gatewayPort}/health`);
-      if (res.ok) break;
-    } catch {
-      /* not up yet */
-    }
-    if (Date.now() > deadline) throw new Error('gateway did not start');
-    await new Promise((r) => setTimeout(r, 150));
-  }
+  await waitForHealth(gatewayPort);
 });
 
 after(async () => {
@@ -283,5 +288,75 @@ describe('the proxy error handler is actually registered', () => {
     assert.doesNotMatch(res.text, /ECONNREFUSED/);
     assert.doesNotMatch(res.text, new RegExp(String(deadPort)));
     assert.doesNotMatch(res.text, /127\.0\.0\.1/);
+  });
+});
+
+// A hung upstream -- one that accepts the connection and never answers -- is a
+// different failure from a refused connection, and the two options that look
+// like they cover it do not behave the same way.
+//
+// http-proxy applies `timeout` to the incoming client socket and registers no
+// handler, so when it fires the connection is dropped with no HTTP response.
+// `proxyTimeout` aborts the outgoing request, which reaches the error handler
+// and produces the documented 503. The gateway shipped only `timeout`, so a
+// hung upstream returned an empty reply after 30 seconds.
+//
+// This runs its own gateway with PROXY_TIMEOUT_MS set low, so the assertion
+// costs about a second rather than half a minute.
+describe('a hung upstream yields the documented 503, not a dropped connection', () => {
+  const PROXY_TIMEOUT_MS = 1000;
+  let hung;
+  let slowGateway;
+  let slowPort;
+
+  before(async () => {
+    const hungPort = await freePort();
+    slowPort = await freePort();
+
+    // Accepts the request, reads it, and never responds.
+    hung = http.createServer((req) => req.resume());
+    await listen(hung, hungPort);
+
+    slowGateway = spawnGateway({
+      PORT: String(slowPort),
+      AUTH_SERVICE_URL: `http://127.0.0.1:${hungPort}`,
+      USER_SERVICE_URL: `http://127.0.0.1:${hungPort}`,
+      POST_SERVICE_URL: `http://127.0.0.1:${hungPort}`,
+      PROXY_TIMEOUT_MS: String(PROXY_TIMEOUT_MS),
+    });
+    await waitForHealth(slowPort);
+  });
+
+  after(async () => {
+    slowGateway?.kill('SIGKILL');
+    await close(hung);
+  });
+
+  it('responds 503 rather than dropping the connection', async () => {
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${slowPort}/api/posts/`);
+    const elapsed = Date.now() - started;
+    const body = await res.json();
+
+    assert.equal(res.status, 503, 'a hung upstream must produce a response, not an empty reply');
+    assert.deepEqual(body, { message: 'Service temporarily unavailable' });
+    assert.ok(
+      elapsed >= PROXY_TIMEOUT_MS - 200,
+      `should wait for the proxy timeout, waited ${elapsed}ms`,
+    );
+  });
+
+  it('gives up near the proxy timeout, not the client timeout', async () => {
+    // The client backstop is PROXY_TIMEOUT_MS + 5000. Landing well inside that
+    // proves proxyTimeout won the race -- with the two equal, the socket drop
+    // wins and there is no response at all.
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${slowPort}/api/users/me`, {
+      headers: { authorization: 'Bearer t' },
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(res.status, 503);
+    assert.ok(elapsed < PROXY_TIMEOUT_MS + 2000, `took ${elapsed}ms, expected near ${PROXY_TIMEOUT_MS}ms`);
   });
 });

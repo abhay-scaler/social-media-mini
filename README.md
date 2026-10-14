@@ -146,10 +146,10 @@ Backend tests use an in-memory MongoDB, so no running database is needed:
 cd services/auth-service && npm ci && npm test   # 18 tests
 cd services/user-service && npm ci && npm test   # 64 tests
 cd services/post-service && npm ci && npm test   # 51 tests
-cd services/api-gateway  && npm ci && npm test   # 15 tests
+cd services/api-gateway  && npm ci && npm test   # 17 tests
 ```
 
-**148 tests in total**, all passing on Node 22. The api-gateway suite uses
+**150 tests in total**, all passing on Node 22. The api-gateway suite uses
 Node's built-in test runner and needs no test dependency; it starts the real
 `server.js` in front of stub upstreams and asserts what they actually receive
 — which is the only way to catch a proxy callback that is silently never

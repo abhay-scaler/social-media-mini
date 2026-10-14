@@ -80,6 +80,24 @@ app.get("/api/health/all", async (req, res) => {
   res.status(allHealthy ? 200 : 503).json({ services, overall: allHealthy ? "healthy" : "degraded" });
 });
 
+// `timeout` and `proxyTimeout` are not interchangeable, and the difference is
+// the whole behaviour here. http-proxy applies `timeout` to the INCOMING
+// client socket (web-incoming.js: `req.socket.setTimeout`) and registers no
+// handler, so when it fires the connection is dropped with no HTTP response at
+// all. `proxyTimeout` applies to the OUTGOING request
+// (`proxyReq.setTimeout(..., () => proxyReq.abort())`), which surfaces as a
+// proxy error and reaches the handler below as the documented 503.
+//
+// This gateway previously set only `timeout`, so a hung upstream produced an
+// empty reply, not a 503. Measured against an upstream that accepts the
+// connection and never answers: `timeout` alone gives no response; a
+// `proxyTimeout` strictly shorter than the client timeout gives 503.
+//
+// They must not be equal -- with both at the same value the socket drop wins
+// the race -- hence the deliberate gap.
+const PROXY_TIMEOUT_MS = Number(process.env.PROXY_TIMEOUT_MS) || 30000;
+const CLIENT_TIMEOUT_MS = PROXY_TIMEOUT_MS + 5000;
+
 // Proxy routes
 //
 // http-proxy-middleware v3 moved every proxy callback under `on`. The old
@@ -122,7 +140,11 @@ const proxyOptions = {
       res.status(503).json({ message: 'Service temporarily unavailable' });
     },
   },
-  timeout: 30000
+  // Bounds the upstream response and yields a 503; see the note above.
+  proxyTimeout: PROXY_TIMEOUT_MS,
+  // Backstop on the client socket, deliberately longer so it never pre-empts
+  // the 503.
+  timeout: CLIENT_TIMEOUT_MS
 };
 
 // Auth service routes

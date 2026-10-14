@@ -132,8 +132,9 @@ dependency is added. It starts the real `server.js` as a child process in
 front of stub upstreams and asserts what those upstreams actually receive: a
 client-supplied `x-internal-token` never arrives (in any capitalisation, and
 when duplicated), `Authorization` does, the `/api/<service>` prefix is
-stripped, and a downed upstream produces the documented JSON 503 rather than
-the library's default plain-text 504.
+stripped, and both a refused and a hung upstream produce the documented JSON
+503 — rather than, respectively, the library's default plain-text 504 and a
+dropped connection with no response at all.
 
 Asserting on the upstream's view is deliberate. The header removal was once
 registered with `onProxyReq`, a key `createProxyMiddleware` ignores silently in

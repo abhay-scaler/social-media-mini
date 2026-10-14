@@ -143,11 +143,11 @@ measured, not estimated.
 | `services/auth-service` | `package.json` `test` | `auth.test.js` (18) | **18 pass** |
 | `services/user-service` | `package.json` `test` | `user.test.js` (10), `imageType.test.js` (17), `imageReference.test.js` (16), `internalAuth.test.js` (21) | **64 pass** |
 | `services/post-service` | `package.json` `test` | `post.test.js` (18), `imageType.test.js` (17), `imageReference.test.js` (16) | **51 pass** |
-| `services/api-gateway` | `package.json` `test` (`node --test`) | `gateway.test.js` (15) | **15 pass** |
+| `services/api-gateway` | `package.json` `test` (`node --test`) | `gateway.test.js` (17) | **17 pass** |
 | `social-media-mini-frontend` | `package.json` | none | **no test tooling at all** |
 | repository root | `scripts/e2e-registration.sh` | the registration saga against a running stack | **34 checks**, stack required |
 
-**148 tracked tests**, plus the 34 stack-level checks in
+**150 tracked tests**, plus the 34 stack-level checks in
 `scripts/e2e-registration.sh`. Of the 133, the 87 in `imageType.test.js` ×2,
 `imageReference.test.js` ×2 and `internalAuth.test.js` import a production
 module; the other 46 run against replica apps — see §2.3 and C1 in §30.
@@ -852,11 +852,13 @@ limiting, health aggregation.
 **Verified behaviour.** Strips `/api/<service>`; forwards the `Authorization`
 header; deletes any client-supplied `x-internal-token` before routing, then
 again on the outgoing request; returns 503 `Service temporarily unavailable` on
-proxy error; 30s proxy timeout; global limiter 100/15min; a catch-all 404
+proxy error; a 30s upstream deadline (`proxyTimeout`, overridable with
+`PROXY_TIMEOUT_MS`) with the client-socket backstop deliberately 5s longer;
+global limiter 100/15min; a catch-all 404
 handler. Requires the three service URLs at module scope or it throws on boot.
 
 **Test strategy.** No unit tests — it has no logic of its own. `gateway.test.js`
-(15 tests, Node's built-in runner, no added dependency) starts the real
+(17 tests, Node's built-in runner, no added dependency) starts the real
 `server.js` in front of stub upstreams and asserts what those upstreams
 receive. Covered today:
 - **Routing correctness:** `/api/<service>/x` → upstream `/x`, on the auth and
@@ -865,8 +867,12 @@ receive. Covered today:
 - **Internal-token stripping:** a client-supplied `x-internal-token` never
   reaches an upstream, in any capitalisation or duplicated, on every proxy
   route — and the attempt creates no profile.
-- **Error contract:** a downed service yields the documented JSON 503, with no
-  upstream host, port or error code in the body.
+- **Error contract:** a refused upstream yields the documented JSON 503, with
+  no upstream host, port or error code in the body.
+- **Timeout contract:** an upstream that accepts the connection and never
+  answers also yields the 503, at roughly the proxy deadline rather than the
+  client backstop. Run against a gateway started with a short
+  `PROXY_TIMEOUT_MS`, so the assertion costs about a second.
 
 Still open: **rate limiting** (the 101st request in the window returns 429) and
 **health aggregation** (200 when all healthy, 503 when one is down); a query

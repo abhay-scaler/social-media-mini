@@ -110,6 +110,14 @@ the top-level `onProxyReq`/`onError` keys and `createProxyMiddleware` ignores
 unrecognised options silently, so a callback registered the old way never runs
 and nothing is logged.
 
+**Timeouts.** `proxyTimeout` bounds how long the gateway waits for an upstream
+(30s by default, override with `PROXY_TIMEOUT_MS`); exceeding it aborts the
+upstream request and returns the 503 above. The separate `timeout` option
+applies to the *client* socket and http-proxy registers no handler for it, so
+when it fires the connection is dropped with no response — it is therefore set
+5s longer, purely as a backstop, and must never be equal to `proxyTimeout` or
+it wins the race and the caller gets an empty reply.
+
 ## Service-to-service calls
 
 Services call each other directly over the Docker network, not through the
