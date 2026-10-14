@@ -14,11 +14,11 @@ builds resolve exactly what the committed lockfiles pin.
 | `security-checks` | The eight fixed bugs have not regressed; upload hardening is intact; no secrets are committed |
 | `backend-tests` | auth-service, post-service, user-service suites (matrix) |
 | `api-gateway` | Dependencies install and the service actually boots |
-| `scripts-check` | Migration script parses and refuses to run unconfigured |
+| `scripts-check` | Migration script parses and refuses to run unconfigured; both shell scripts parse |
 | `frontend` | ESLint, production build, bundle secret scan |
 | `compose-config` | The Compose file parses; Supabase vars reach only the upload services |
 | `docker-build` | All five images build (matrix, with layer caching) |
-| `stack-integration` | The microservices stack boots healthy with real MongoDB and Redis |
+| `stack-integration` | The microservices stack boots healthy with real MongoDB and Redis, and the registration saga is verified end to end |
 | `ci-complete` | Fails if any job failed or was cancelled, so a skipped job cannot read as green |
 
 ### Reproducibility
@@ -59,9 +59,11 @@ searches for.
 
 No real Supabase credential is used anywhere in CI.
 
-- `stack-integration` generates a throwaway `JWT_SECRET` per run with
-  `openssl rand -hex 32` and masks it, so nothing is stored in the repository or
-  recoverable from the logs.
+- `stack-integration` generates a throwaway `JWT_SECRET`, `MONGO_ROOT_PASSWORD`
+  and `INTERNAL_SERVICE_TOKEN` per run with `openssl rand -hex`, and masks each
+  one, so nothing is stored in the repository or recoverable from the logs.
+  auth-service and user-service both refuse to start without
+  `INTERNAL_SERVICE_TOKEN`, so the stack cannot boot unless CI supplies it.
 - Supabase variables are set to inert placeholders
   (`https://ci-placeholder.supabase.co`). These exercise the client-construction
   path so the services start with Supabase configured, but reach nothing.
@@ -91,7 +93,17 @@ health failure in the step that follows. It then brings the stack up with
 4. Each application logged `MongoDB Connected` and `Redis Connected` — proving
    the apps established their backing connections, not merely that the
    processes are listening.
-5. post-service and user-service did *not* log the
+5. The registration saga, via `scripts/e2e-registration.sh` — the only CI step
+   that exercises application behaviour against the real containers. It
+   registers a user through Nginx and the gateway, reads the profile back out
+   of user-service, asserts `/sync-user` is unreachable from a client even
+   with the correct token, drives the internal guard with missing,
+   wrong-length, wrong-value and multibyte tokens, and stops user-service to
+   prove registration returns 503, rolls the credential record back, and
+   leaves the email address free. The script restores user-service on every
+   exit path, and `INTERNAL_SERVICE_TOKEN` reaches it from the job
+   environment, so no token value is ever printed.
+6. post-service and user-service did *not* log the
    "Supabase credentials not set" fallback, confirming they received their
    configuration.
 

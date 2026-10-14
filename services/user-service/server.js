@@ -11,7 +11,7 @@ import { randomUUID } from "crypto";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
 import { detectImageType } from "./imageType.js";
 import { validateImageReference } from "./imageReference.js";
-import crypto from "crypto";
+import { requireInternalAuth } from "./internalAuth.js";
 
 dotenv.config();
 
@@ -167,30 +167,8 @@ connectRedis();
 connectElasticsearch();
 
 // Auth middleware
-// Service-to-service guard for endpoints that no end user ever calls.
-// /sync-user runs during registration, before the new user has a token, so it
-// cannot use `protect`. It is reachable through the gateway, so without this it
-// would accept an attacker-controlled profile -- including _id, email and a
-// pre-hashed password. Compared in constant time to avoid leaking the secret
-// through response timing.
-const requireInternalAuth = (req, res, next) => {
-  const presented = req.headers["x-internal-token"];
-  const expected = process.env.INTERNAL_SERVICE_TOKEN;
-  if (typeof expected !== "string" || expected.length === 0) {
-    // Startup already refuses this state; reject rather than throw if it ever
-    // occurs anyway, so the failure mode stays 401 and never 500-with-stack.
-    return res.status(401).json({ message: "Unauthorized" });
-  }
-  if (typeof presented !== "string" || presented.length !== expected.length) {
-    return res.status(401).json({ message: "Unauthorized" });
-  }
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
-  if (!crypto.timingSafeEqual(a, b)) {
-    return res.status(401).json({ message: "Unauthorized" });
-  }
-  next();
-};
+// requireInternalAuth guards /sync-user; it lives in internalAuth.js so it can
+// be tested against the code this service actually runs.
 
 const protect = async (req, res, next) => {
   try {

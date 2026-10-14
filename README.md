@@ -58,7 +58,9 @@ joins. Full detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Internal service boundary.** `POST /sync-user` runs during registration,
   before the new user has a token, so it cannot use the normal JWT middleware.
   It is authenticated with a shared `INTERNAL_SERVICE_TOKEN` compared in
-  constant time, and both services refuse to start without it.
+  constant time, and both services refuse to start without it. The gateway
+  strips the header from client requests, so the endpoint is reachable only
+  from inside the Docker network.
 
 ## Prerequisites
 
@@ -142,12 +144,12 @@ Backend tests use an in-memory MongoDB, so no running database is needed:
 
 ```bash
 cd services/auth-service && npm ci && npm test   # 18 tests
-cd services/user-service && npm ci && npm test   # 37 tests
-cd services/post-service && npm ci && npm test   # 45 tests
+cd services/user-service && npm ci && npm test   # 64 tests
+cd services/post-service && npm ci && npm test   # 51 tests
 ```
 
-**100 tests in total**, all passing on Node 22 at the time of publication.
-`services/api-gateway` has no suite.
+**133 tests in total**, all passing on Node 22. `services/api-gateway` has no
+suite.
 
 Repository-level security and regression checks, the same ones CI runs:
 
@@ -155,14 +157,32 @@ Repository-level security and regression checks, the same ones CI runs:
 ./scripts/ci-security-checks.sh
 ```
 
-This script is worth a look: it asserts both that previously fixed defects have
-not returned **and** that specific hardening is still present — removing a
-control fails the build rather than passing quietly.
+This script is worth a look: its 29 assertions check both that previously fixed
+defects have not returned **and** that specific hardening is still present —
+removing a control fails the build rather than passing quietly.
+
+### The registration saga, end to end
+
+Registration spans two services and two databases, so no unit test and no
+health check can tell you it works. This script asserts it against a running
+stack, through port 80 — the path a browser takes:
+
+```bash
+INTERNAL_SERVICE_TOKEN=<the value the stack was started with> \
+  ./scripts/e2e-registration.sh
+```
+
+It registers a user through Nginx and the gateway, reads the profile back from
+user-service, confirms `/sync-user` is unreachable from a client even with the
+correct token, exercises the internal guard with missing, wrong-length,
+wrong-value and multibyte tokens, and then **stops user-service** to prove the
+saga returns 503, rolls the credential record back, and frees the email address
+for a later attempt. CI runs it in the `stack-integration` job.
 
 **An honest caveat.** The three service suites build a replica Express app
 inside the test file rather than importing the service's own `server.js`, so
-they do not exercise shipped code. The `imageType` and `imageReference` suites
-are the exception. This is a known, documented gap — see
+they do not exercise shipped code. The `imageType`, `imageReference` and
+`internalAuth` suites are the exception. This is a known, documented gap — see
 [docs/tests/TEST-PLAN.md](docs/tests/TEST-PLAN.md) §30 — and it is the single
 highest-priority item in the project's own test plan.
 
@@ -189,8 +209,10 @@ Stated plainly because the documentation is only useful if it is accurate.
 - **No pagination.** `GET /` returns every post; search is capped at 10 results.
 - **The feed does an N+1 fan-out** on a cache miss — one user lookup per post,
   comment, and reply. The 300-second cache is what makes it viable.
-- **No frontend tests and no end-to-end tests.** Test tooling for the SPA does
-  not exist in this repository.
+- **No frontend tests and no browser end-to-end tests.** Test tooling for the
+  SPA does not exist in this repository. The registration journey is covered at
+  the API level against the real stack (above); every other journey — posting,
+  commenting, the real-time feed — is verified only by hand.
 - **No staging environment**, so `main` deploys straight to the instance. The
   mitigation is a deployment smoke check and a rehearsed rollback.
 

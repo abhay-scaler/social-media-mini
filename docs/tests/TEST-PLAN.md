@@ -140,14 +140,17 @@ measured, not estimated.
 
 | Location | Command source | Suites | Measured result |
 | --- | --- | --- | --- |
-| `services/auth-service` | `package.json` `test` | `auth.test.js` | **18 pass** |
-| `services/user-service` | `package.json` `test` | `user.test.js`, `imageType.test.js` | **27 pass** |
-| `services/post-service` | `package.json` `test` | `post.test.js`, `imageType.test.js` | **35 pass** |
+| `services/auth-service` | `package.json` `test` | `auth.test.js` (18) | **18 pass** |
+| `services/user-service` | `package.json` `test` | `user.test.js` (10), `imageType.test.js` (17), `imageReference.test.js` (16), `internalAuth.test.js` (21) | **64 pass** |
+| `services/post-service` | `package.json` `test` | `post.test.js` (18), `imageType.test.js` (17), `imageReference.test.js` (16) | **51 pass** |
 | `services/api-gateway` | — | none | **no `test` script** |
 | `social-media-mini-frontend` | `package.json` | none | **no test tooling at all** |
+| repository root | `scripts/e2e-registration.sh` | the registration saga against a running stack | **34 checks**, stack required |
 
-**80 tracked tests.** Of those, the `imageType.test.js` pair (17 per service) is
-the only part importing a production module — see §2.3 and C1 in §30.
+**133 tracked tests**, plus the 34 stack-level checks in
+`scripts/e2e-registration.sh`. Of the 133, the 87 in `imageType.test.js` ×2,
+`imageReference.test.js` ×2 and `internalAuth.test.js` import a production
+module; the other 46 run against replica apps — see §2.3 and C1 in §30.
 
 What that pair actually asserts, since it is the repository's only real
 coverage of shipped code: `detectImageType` accepts **JPEG, PNG, GIF87a,
@@ -200,8 +203,21 @@ required because the services are ES modules; `transform: {}` in each
 `package.json` `jest` block disables Babel for the same reason, and
 `testTimeout` is **30000 ms**.
 
-Measured wall-clock on Node 22: auth-service ~13 s (`auth.test.js` alone),
-user-service ~9 s, post-service ~7 s.
+Measured wall-clock on Node 22: auth-service ~15 s (`auth.test.js` alone),
+user-service ~12 s, post-service ~12 s.
+
+The saga checks need a running stack rather than `mongodb-memory-server`, so
+they are a separate command:
+
+```bash
+docker compose -f docker-compose.microservices.yml up -d --wait
+INTERNAL_SERVICE_TOKEN=<the value the stack was started with> \
+  ./scripts/e2e-registration.sh
+```
+
+It requires `curl`, `python3` and the Compose plugin, prints no token value,
+and restores user-service on every exit path — including a failure part-way
+through the rollback check, which deliberately stops that container.
 
 ### 0.4 Coverage reporting
 
@@ -229,6 +245,10 @@ regardless of what §22 targets.
 `api-gateway` has no suite, so its job runs `node --check server.js` plus a real
 boot with liveness verification. `frontend` runs ESLint, a production build and
 a bundle secret scan — no tests, because none exist.
+
+`stack-integration` additionally runs `scripts/e2e-registration.sh` after the
+health probes, which is the only CI step that exercises application behaviour
+against the real containers rather than a replica app or an in-memory database.
 
 ### 0.6 Troubleshooting
 
@@ -525,11 +545,11 @@ That layer is fast (seconds), hermetic, and tests shipped code.
 
 | Layer | Tests | Tests *shipped* code? |
 | --- | --- | --- |
-| Unit | 34 (`imageType` ×2) | ✅ yes |
+| Unit | 87 (`imageType` ×2 = 34, `imageReference` ×2 = 32, `internalAuth` 21) | ✅ yes |
 | Service API | 46 (auth 18, user 10, post 18) | ❌ **no — replica apps** |
-| Integration | 1 file, untracked, failing | n/a |
+| Cross-service integration | 34 checks (`scripts/e2e-registration.sh`, stack job) | ✅ yes — the real containers |
 | Contract | 0 | — |
-| E2E | 0 | — |
+| Browser E2E | 0 | — |
 | Production smoke | 0 | — |
 
 ---
@@ -555,9 +575,9 @@ graph TD
 
 **L0 — Static analysis & security**
 *Purpose:* catch defects without executing the product.
-*Scope:* ESLint on the frontend; `scripts/ci-security-checks.sh` (23 assertions
-covering regression patterns and committed secrets); CodeQL; `npm ci` lockfile
-reproducibility.
+*Scope:* ESLint on the frontend; `scripts/ci-security-checks.sh` (29 assertions
+covering regression patterns, required hardening, and committed secrets);
+CodeQL; `npm ci` lockfile reproducibility.
 *Mocked:* nothing. *Real infra:* none. *Speed:* seconds.
 *Frequency:* every push. *CI stage:* `security-checks`, `frontend`.
 *Owner:* whoever opens the PR. *Gate:* **blocking.**
@@ -611,8 +631,10 @@ eviction; Mongo unique-index violation on duplicate `email`.
 
 **L6 — Cross-service integration**
 *Purpose:* verify the trust and data flows between services.
-*Scope:* the registration→sync saga and its rollback; `protect` against a live
-auth-service; the `PUT /me` → `posts:feed:global` invalidation.
+*Scope:* **implemented** for the registration→sync saga, its internal service
+boundary and its rollback — `scripts/e2e-registration.sh`, 34 checks, run by
+the `stack-integration` job. **Still open:** `protect` against a live
+auth-service, and the `PUT /me` → `posts:feed:global` invalidation.
 *Real infra:* the full Compose stack.
 *Speed:* minutes including stack boot. *CI stage:* `stack-integration`.
 *Owner:* platform/QA jointly. *Gate:* blocking on `main`.

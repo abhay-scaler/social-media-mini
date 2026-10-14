@@ -160,6 +160,28 @@ require_pattern "post-service uploads cannot overwrite objects" \
 require_pattern "user-service uploads cannot overwrite objects" \
   'upsert: false' services/user-service/server.js
 
+# The internal service boundary. /sync-user accepts a whole profile -- _id,
+# email and a pre-hashed password -- and runs before the new user has a token,
+# so these four assertions are the only thing keeping it off the open internet.
+require_pattern "user-service guards /sync-user with the internal token" \
+  'app\.post\("/sync-user", requireInternalAuth' services/user-service/server.js
+require_pattern "the internal guard compares in constant time" \
+  'timingSafeEqual' services/user-service/internalAuth.js
+require_pattern "auth-service refuses to start without INTERNAL_SERVICE_TOKEN" \
+  'INTERNAL_SERVICE_TOKEN' services/auth-service/server.js
+require_pattern "user-service refuses to start without INTERNAL_SERVICE_TOKEN" \
+  'INTERNAL_SERVICE_TOKEN' services/user-service/server.js
+require_pattern "the gateway strips a client-supplied internal token" \
+  "removeHeader\('x-internal-token'\)" services/api-gateway/server.js
+
+# Regression lock: the guard compared STRING length before calling
+# timingSafeEqual, which throws a RangeError unless the BYTE lengths match. A
+# multibyte header could therefore turn an unauthenticated request into a 500
+# with a stack trace. Comparing the buffers' own lengths is what fixed it, so
+# assert the buffers are what gets measured.
+require_pattern "the internal guard compares byte length, not string length" \
+  'a\.length !== b\.length' services/user-service/internalAuth.js
+
 echo
 echo "== Committed secrets =="
 

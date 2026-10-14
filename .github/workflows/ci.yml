@@ -11,8 +11,11 @@ name: CI
 #                      two services that upload.
 #   docker-build       All five images build.
 #   stack-integration  The microservices stack boots, every service reports
-#                      healthy, and MongoDB/Redis connectivity is confirmed
-#                      from the application logs.
+#                      healthy, MongoDB/Redis connectivity is confirmed from
+#                      the application logs, and the registration saga is
+#                      exercised end to end through the published port --
+#                      including the internal service boundary and the
+#                      rollback that runs when the profile sync fails.
 #
 # No step uses a real Supabase service-role key. The stack job runs with
 # throwaway values generated at run time, which exercises the configured code
@@ -157,7 +160,7 @@ jobs:
           fi
 
   scripts-check:
-    name: Check migration script
+    name: Check repository scripts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -177,6 +180,13 @@ jobs:
 
       - name: Script parses
         run: node --check scripts/migrate-base64-images.js
+
+      # Both shell scripts run in other jobs, where a syntax error would read
+      # as a failed assertion rather than a broken script.
+      - name: Shell scripts parse
+        run: |
+          bash -n scripts/ci-security-checks.sh
+          bash -n scripts/e2e-registration.sh
 
       # The migration touches real data, so it must refuse to run rather than
       # guess at a database when its configuration is absent.
@@ -496,6 +506,17 @@ jobs:
             fi
             echo "ok  $svc initialised its Supabase client"
           done
+
+      # The checks above prove every container starts and answers /health.
+      # This one proves registration actually works, which no health endpoint
+      # touches: the saga spans auth-service, user-service and two databases,
+      # authenticates the hop between them with INTERNAL_SERVICE_TOKEN, and
+      # rolls the credential record back if the profile sync fails.
+      #
+      # The script stops and restarts user-service to exercise that rollback,
+      # and restores it on every exit path.
+      - name: Registration saga end-to-end
+        run: ./scripts/e2e-registration.sh
 
       # Runs on failure of ANY preceding step, including `up --wait` aborting
       # because a dependency never became healthy -- the case where no service
