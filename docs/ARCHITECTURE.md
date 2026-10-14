@@ -94,7 +94,21 @@ so the same build works in both environments:
 The gateway strips the `/api/<service>` prefix before forwarding, so
 `/api/auth/register` arrives at auth-service as `/register`. It also forwards the
 `Authorization` header explicitly and returns `503` with
-`{"message":"Service temporarily unavailable"}` on a proxy error.
+`{"message":"Service temporarily unavailable"}` on a proxy error. The error
+body carries no detail from the underlying error, which names the upstream
+host and port.
+
+It also **deletes any client-supplied `x-internal-token`** from every inbound
+request before routing it, and again on the outgoing proxy request. That header
+authenticates the service-to-service call described below and never
+legitimately arrives from a client; forwarding one would make a leaked token
+replayable from outside the Docker network against `POST /sync-user`, which
+accepts a complete profile including `_id`, `email` and a pre-hashed password.
+
+Proxy callbacks are registered under `on` — http-proxy-middleware v3 removed
+the top-level `onProxyReq`/`onError` keys and `createProxyMiddleware` ignores
+unrecognised options silently, so a callback registered the old way never runs
+and nothing is logged.
 
 ## Service-to-service calls
 
