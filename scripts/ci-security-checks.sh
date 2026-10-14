@@ -172,7 +172,27 @@ require_pattern "auth-service refuses to start without INTERNAL_SERVICE_TOKEN" \
 require_pattern "user-service refuses to start without INTERNAL_SERVICE_TOKEN" \
   'INTERNAL_SERVICE_TOKEN' services/user-service/server.js
 require_pattern "the gateway strips a client-supplied internal token" \
-  "removeHeader\('x-internal-token'\)" services/api-gateway/server.js
+  'INTERNAL_TOKEN_HEADER' services/api-gateway/server.js
+require_pattern "the gateway strips it before any proxy route sees it" \
+  'delete req\.headers\[name\]' services/api-gateway/server.js
+
+# http-proxy-middleware v3 moved proxy callbacks under `on`, and
+# createProxyMiddleware ignores unrecognised top-level options SILENTLY. The
+# gateway shipped `onProxyReq`, so its header removal never ran and a client
+# could present a valid internal token to /sync-user. Asserting that the text
+# removeHeader(...) was present did NOT catch that -- the dead code was there.
+# Assert the registration mechanism instead, in both directions.
+require_pattern "the gateway registers proxy callbacks under the v3 on API" \
+  '^  on: \{' services/api-gateway/server.js
+
+V3_REMOVED=$(grep -nE '^[[:space:]]*(onProxyReq|onError|onProxyRes|logLevel)[[:space:]]*:' \
+  services/api-gateway/server.js 2>/dev/null)
+if [ -n "$V3_REMOVED" ]; then
+  fail "the gateway uses proxy options removed in v3 (ignored silently, so the callback never runs)"
+  printf '%s\n' "$V3_REMOVED" | sed 's/^/          /'
+else
+  pass "the gateway uses no proxy options removed in v3"
+fi
 
 # Regression lock: the guard compared STRING length before calling
 # timingSafeEqual, which throws a RangeError unless the BYTE lengths match. A

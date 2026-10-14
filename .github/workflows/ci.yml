@@ -4,7 +4,7 @@ name: CI
 #
 #   security-checks    Fixed bugs have not regressed; no secrets are committed.
 #   backend-tests      auth/post/user Jest suites on Node 22.
-#   api-gateway        Dependency install and module load (it has no test suite).
+#   api-gateway        Dependency install, proxy-behaviour tests, module load.
 #   scripts-check      Migration script parses and refuses to run unconfigured.
 #   frontend           ESLint, production build, and a bundle secret scan.
 #   compose-config     The Compose file parses; Supabase vars reach only the
@@ -120,10 +120,14 @@ jobs:
       - name: Lockfile is reproducible
         run: git diff --exit-code -- services/api-gateway/package-lock.json
 
-      # api-gateway ships no test or lint script. Rather than a suppressed
-      # command that always "succeeds", verify the module actually parses and
-      # its imports resolve. Its runtime behaviour is covered by the health
-      # check in stack-integration.
+      # Proxy behaviour, asserted against the real server.js running in front
+      # of stub upstreams: that a client-supplied x-internal-token never
+      # reaches an internal service, that Authorization still does, and that
+      # the error callback is registered. node:test, so no test dependency.
+      - name: Proxy behaviour tests
+        working-directory: services/api-gateway
+        run: npm test
+
       - name: Module parses and imports resolve
         working-directory: services/api-gateway
         # Non-secret routing config. The gateway builds its proxy middleware at

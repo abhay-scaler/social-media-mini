@@ -13,7 +13,7 @@ builds resolve exactly what the committed lockfiles pin.
 | --- | --- |
 | `security-checks` | The eight fixed bugs have not regressed; upload hardening is intact; no secrets are committed |
 | `backend-tests` | auth-service, post-service, user-service suites (matrix) |
-| `api-gateway` | Dependencies install and the service actually boots |
+| `api-gateway` | Dependencies install, proxy behaviour is asserted against stub upstreams, and the service actually boots |
 | `scripts-check` | Migration script parses and refuses to run unconfigured; both shell scripts parse |
 | `frontend` | ESLint, production build, bundle secret scan |
 | `compose-config` | The Compose file parses; Supabase vars reach only the upload services |
@@ -127,12 +127,25 @@ config that no longer matches the running containers.
 
 ### api-gateway
 
-api-gateway ships no test or lint script. Rather than a suppressed command that
-always reports success, CI parses the module and starts it for real, failing if
-the process exits during startup. It requires `AUTH_SERVICE_URL`,
-`USER_SERVICE_URL`, and `POST_SERVICE_URL` to boot — it builds its proxy
-middleware at module scope and throws on an undefined target — so the step
-supplies those non-secret URLs, as Compose does.
+`npm test` runs `gateway.test.js` on Node's built-in test runner — no test
+dependency is added. It starts the real `server.js` as a child process in
+front of stub upstreams and asserts what those upstreams actually receive: a
+client-supplied `x-internal-token` never arrives (in any capitalisation, and
+when duplicated), `Authorization` does, the `/api/<service>` prefix is
+stripped, and a downed upstream produces the documented JSON 503 rather than
+the library's default plain-text 504.
+
+Asserting on the upstream's view is deliberate. The header removal was once
+registered with `onProxyReq`, a key `createProxyMiddleware` ignores silently in
+http-proxy-middleware v3, so the callback never ran. A test that called the
+callback directly, or grepped the source for `removeHeader`, would have passed
+against that build.
+
+CI then still parses the module and starts it for real, failing if the process
+exits during startup. It requires `AUTH_SERVICE_URL`, `USER_SERVICE_URL`, and
+`POST_SERVICE_URL` to boot — it builds its proxy middleware at module scope and
+throws on an undefined target — so the step supplies those non-secret URLs, as
+Compose does.
 
 ### Known-failing integration test
 

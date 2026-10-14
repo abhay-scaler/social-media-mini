@@ -146,10 +146,14 @@ Backend tests use an in-memory MongoDB, so no running database is needed:
 cd services/auth-service && npm ci && npm test   # 18 tests
 cd services/user-service && npm ci && npm test   # 64 tests
 cd services/post-service && npm ci && npm test   # 51 tests
+cd services/api-gateway  && npm ci && npm test   # 15 tests
 ```
 
-**133 tests in total**, all passing on Node 22. `services/api-gateway` has no
-suite.
+**148 tests in total**, all passing on Node 22. The api-gateway suite uses
+Node's built-in test runner and needs no test dependency; it starts the real
+`server.js` in front of stub upstreams and asserts what they actually receive
+— which is the only way to catch a proxy callback that is silently never
+invoked.
 
 Repository-level security and regression checks, the same ones CI runs:
 
@@ -157,7 +161,7 @@ Repository-level security and regression checks, the same ones CI runs:
 ./scripts/ci-security-checks.sh
 ```
 
-This script is worth a look: its 29 assertions check both that previously fixed
+This script is worth a look: its 32 assertions check both that previously fixed
 defects have not returned **and** that specific hardening is still present —
 removing a control fails the build rather than passing quietly.
 

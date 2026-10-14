@@ -143,11 +143,11 @@ measured, not estimated.
 | `services/auth-service` | `package.json` `test` | `auth.test.js` (18) | **18 pass** |
 | `services/user-service` | `package.json` `test` | `user.test.js` (10), `imageType.test.js` (17), `imageReference.test.js` (16), `internalAuth.test.js` (21) | **64 pass** |
 | `services/post-service` | `package.json` `test` | `post.test.js` (18), `imageType.test.js` (17), `imageReference.test.js` (16) | **51 pass** |
-| `services/api-gateway` | — | none | **no `test` script** |
+| `services/api-gateway` | `package.json` `test` (`node --test`) | `gateway.test.js` (15) | **15 pass** |
 | `social-media-mini-frontend` | `package.json` | none | **no test tooling at all** |
 | repository root | `scripts/e2e-registration.sh` | the registration saga against a running stack | **34 checks**, stack required |
 
-**133 tracked tests**, plus the 34 stack-level checks in
+**148 tracked tests**, plus the 34 stack-level checks in
 `scripts/e2e-registration.sh`. Of the 133, the 87 in `imageType.test.js` ×2,
 `imageReference.test.js` ×2 and `internalAuth.test.js` import a production
 module; the other 46 run against replica apps — see §2.3 and C1 in §30.
@@ -242,8 +242,8 @@ is a three-way matrix (`auth-service`, `post-service`, `user-service`) with
 `npm test`. **It does not run coverage**, so no coverage gate is enforced today
 regardless of what §22 targets.
 
-`api-gateway` has no suite, so its job runs `node --check server.js` plus a real
-boot with liveness verification. `frontend` runs ESLint, a production build and
+`api-gateway` runs `npm test` (Node's built-in runner, no added dependency),
+then `node --check server.js` plus a real boot with liveness verification. `frontend` runs ESLint, a production build and
 a bundle secret scan — no tests, because none exist.
 
 `stack-integration` additionally runs `scripts/e2e-registration.sh` after the
@@ -547,6 +547,7 @@ That layer is fast (seconds), hermetic, and tests shipped code.
 | --- | --- | --- |
 | Unit | 87 (`imageType` ×2 = 34, `imageReference` ×2 = 32, `internalAuth` 21) | ✅ yes |
 | Service API | 46 (auth 18, user 10, post 18) | ❌ **no — replica apps** |
+| Gateway proxy | 15 (`gateway.test.js`) | ✅ yes — the real `server.js` |
 | Cross-service integration | 34 checks (`scripts/e2e-registration.sh`, stack job) | ✅ yes — the real containers |
 | Contract | 0 | — |
 | Browser E2E | 0 | — |
@@ -575,7 +576,7 @@ graph TD
 
 **L0 — Static analysis & security**
 *Purpose:* catch defects without executing the product.
-*Scope:* ESLint on the frontend; `scripts/ci-security-checks.sh` (29 assertions
+*Scope:* ESLint on the frontend; `scripts/ci-security-checks.sh` (32 assertions
 covering regression patterns, required hardening, and committed secrets);
 CodeQL; `npm ci` lockfile reproducibility.
 *Mocked:* nothing. *Real infra:* none. *Speed:* seconds.
@@ -849,28 +850,39 @@ limiting, health aggregation.
 **Dependencies.** The three services by URL. No database, no cache.
 
 **Verified behaviour.** Strips `/api/<service>`; forwards the `Authorization`
-header explicitly; returns 503 `Service temporarily unavailable` on proxy
-error; 30s proxy timeout; global limiter 100/15min; a catch-all 404 handler.
-Requires the three service URLs at module scope or it throws on boot.
+header; deletes any client-supplied `x-internal-token` before routing, then
+again on the outgoing request; returns 503 `Service temporarily unavailable` on
+proxy error; 30s proxy timeout; global limiter 100/15min; a catch-all 404
+handler. Requires the three service URLs at module scope or it throws on boot.
 
-**Test strategy.** No unit tests — it has no logic of its own. The valuable
-tests are:
-- **Routing correctness:** assert `/api/auth/x` → auth-service `/x`, for all
-  three prefixes, including a path with a query string and a nested path.
+**Test strategy.** No unit tests — it has no logic of its own. `gateway.test.js`
+(15 tests, Node's built-in runner, no added dependency) starts the real
+`server.js` in front of stub upstreams and asserts what those upstreams
+receive. Covered today:
+- **Routing correctness:** `/api/<service>/x` → upstream `/x`, on the auth and
+  users prefixes.
 - **Header forwarding:** `Authorization` survives the hop.
-- **Error contract:** a downed service yields 503 with the documented body, not
-  a hang or a 502.
-- **Rate limiting:** the 101st request in the window returns 429.
-- **Health aggregation:** 200 when all healthy, 503 when one is down.
+- **Internal-token stripping:** a client-supplied `x-internal-token` never
+  reaches an upstream, in any capitalisation or duplicated, on every proxy
+  route — and the attempt creates no profile.
+- **Error contract:** a downed service yields the documented JSON 503, with no
+  upstream host, port or error code in the body.
 
-Best implemented as **cross-service integration tests against the real stack**,
-or in-process with `nock`-style HTTP interception once the app is exported. CI
-currently only verifies that the module boots — honest, but thin.
+Still open: **rate limiting** (the 101st request in the window returns 429) and
+**health aggregation** (200 when all healthy, 503 when one is down); a query
+string and a deeper nested path are untested on the routing side.
 
-**Risk.** It has **no test suite at all** and no `test` script. Its CI job runs
-`node --check` plus a real boot with liveness verification. That catches syntax
-and import errors, not routing regressions. A path-rewrite regex change could
-break every route in the system and CI would pass.
+**Why against a running process.** The header removal was once registered as
+`onProxyReq`, an option `createProxyMiddleware` ignores silently in
+http-proxy-middleware v3, so it never executed. A test invoking the callback
+directly — or asserting `removeHeader` appears in the source — passes against
+that build. Only the upstream's own view of the request catches it. See
+Appendix A.
+
+**Residual risk.** A path-rewrite regex change is now caught for two prefixes,
+but the posts prefix is exercised only through the error path, and the
+`stack-integration` job remains the only check on the real nginx → gateway →
+service chain.
 
 ### 4.5 frontend
 
