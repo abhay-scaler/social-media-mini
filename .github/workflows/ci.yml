@@ -239,6 +239,7 @@ jobs:
       SUPABASE_STORAGE_BUCKET: uploads
       JWT_SECRET: ci-placeholder-config-validation-only
       MONGO_ROOT_PASSWORD: ci-placeholder-config-validation-only
+      INTERNAL_SERVICE_TOKEN: ci-placeholder-config-validation-only
     steps:
       - uses: actions/checkout@v4
 
@@ -368,10 +369,15 @@ jobs:
         run: |
           JWT="$(openssl rand -hex 32)"
           MONGO_PW="$(openssl rand -hex 24)"
+          # auth-service and user-service both refuse to start without this,
+          # so the stack cannot boot unless CI supplies one too.
+          INTERNAL="$(openssl rand -hex 32)"
           echo "::add-mask::$JWT"
           echo "::add-mask::$MONGO_PW"
+          echo "::add-mask::$INTERNAL"
           echo "JWT_SECRET=$JWT" >> "$GITHUB_ENV"
           echo "MONGO_ROOT_PASSWORD=$MONGO_PW" >> "$GITHUB_ENV"
+          echo "INTERNAL_SERVICE_TOKEN=$INTERNAL" >> "$GITHUB_ENV"
 
       # Building separately keeps an image build failure from being mistaken for
       # a health failure in the step that follows.
