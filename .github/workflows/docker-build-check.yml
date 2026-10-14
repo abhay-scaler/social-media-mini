@@ -1,0 +1,88 @@
+name: Docker Build Check
+
+# Builds every service image for both published architectures WITHOUT pushing,
+# so a cross-architecture regression is caught on the pull request instead of
+# after a merge. Docker Publish only runs on pushes to main, tags and releases,
+# so before this workflow existed no PR could exercise an arm64 image build.
+#
+# This workflow never authenticates to a registry and never pushes, so it
+# cannot touch a production tag.
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-check:
+    name: Build ${{ matrix.service.name }} for amd64 + arm64
+    runs-on: ubuntu-latest
+    # The same bound Docker Publish carries: a wedged emulated step must fail
+    # rather than idle out GitHub's 360-minute default.
+    timeout-minutes: 30
+
+    strategy:
+      # One service's failure must not hide another's.
+      fail-fast: false
+      matrix:
+        service:
+          - path: services/auth-service
+            name: auth-service
+          - path: services/post-service
+            name: post-service
+          - path: services/user-service
+            name: user-service
+          - path: services/api-gateway
+            name: api-gateway
+          - path: social-media-mini-frontend
+            name: frontend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Still required: BuildKit needs the arm64 platform registered to assemble
+      # an arm64 image, even though the fix means no RUN instruction executes
+      # under emulation any more.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Record what the runner is, so a future emulation failure can be
+      # attributed to a CPU rather than guessed at. The SIGILL crashes this fix
+      # addresses correlate with AVX-512 runners, which buildx reports as
+      # linux/amd64/v4.
+      - name: Record builder platforms
+        run: |
+          echo "buildx platforms:"
+          docker buildx inspect --bootstrap | grep -i '^Platforms:' || true
+          echo "cpu flags (avx512 presence is the reported crash correlate):"
+          lscpu | grep -iE '^(Model name|Flags)' | cut -c1-200 || true
+
+      - name: Build both architectures (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.path }}
+          push: false
+          platforms: linux/amd64,linux/arm64
+          # Read the publish workflow's cache but do not write to it, so this
+          # check cannot interfere with Docker Publish.
+          cache-from: type=gha
+
+      # Proves the claim this fix rests on: the runtime stage must execute
+      # nothing, or an arm64 build would still run code under QEMU.
+      - name: Runtime stage runs no commands
+        run: |
+          set -euo pipefail
+          df="${{ matrix.service.path }}/Dockerfile"
+          last_from=$(grep -n '^FROM' "$df" | tail -1 | cut -d: -f1)
+          if tail -n +"$last_from" "$df" | grep -qE '^[[:space:]]*(RUN|SHELL)[[:space:]]'; then
+            echo "::error file=$df::the final stage contains a RUN/SHELL instruction, which would execute under emulation for the arm64 image"
+            exit 1
+          fi
+          echo "ok  $df final stage has no RUN/SHELL"

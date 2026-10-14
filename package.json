@@ -1,0 +1,17 @@
+{
+  "name": "social-media-mini-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Repository-level operational scripts (see scripts/).",
+  "scripts": {
+    "migrate:images": "node scripts/migrate-base64-images.js",
+    "migrate:images:dry-run": "DRY_RUN=1 node scripts/migrate-base64-images.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "dotenv": "^17.2.3",
+    "mongoose": "^8.19.3"
+  },
+  "license": "MIT"
+}

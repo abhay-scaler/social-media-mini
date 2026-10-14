@@ -1,0 +1,8 @@
+# Keep the build context free of a host node_modules: it may be built for the
+# wrong architecture, and it would otherwise be copied over the modules the
+# deps stage installed for the target platform.
+node_modules
+coverage
+npm-debug.log
+.env
+.git

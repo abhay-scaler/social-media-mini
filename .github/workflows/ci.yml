@@ -1,0 +1,580 @@
+name: CI
+
+# What this pipeline verifies, in order of cost:
+#
+#   security-checks    Fixed bugs have not regressed; no secrets are committed.
+#   backend-tests      auth/post/user Jest suites on Node 22.
+#   api-gateway        Dependency install and module load (it has no test suite).
+#   scripts-check      Migration script parses and refuses to run unconfigured.
+#   frontend           ESLint, production build, and a bundle secret scan.
+#   compose-config     The Compose file parses; Supabase vars reach only the
+#                      two services that upload.
+#   docker-build       All five images build.
+#   stack-integration  The microservices stack boots, every service reports
+#                      healthy, and MongoDB/Redis connectivity is confirmed
+#                      from the application logs.
+#
+# No step uses a real Supabase service-role key. The stack job runs with
+# throwaway values generated at run time, which exercises the configured code
+# path without granting access to anything. Real upload round-trips are
+# therefore not covered here -- see docs/supabase-setup.md.
+
+on:
+  push:
+    branches: [ main, develop, 'fix/**', 'feat/**' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+# A newer push to the same ref makes an in-flight run obsolete.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+permissions:
+  contents: read
+
+jobs:
+  security-checks:
+    name: Security and regression checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Asserts the eight fixed bugs stay fixed, that the upload hardening is
+      # still in place, and that no credentials are committed. Negative-tested:
+      # reintroducing any of those patterns fails this step.
+      # Invoked via bash rather than ./ so the step does not depend on the
+      # executable bit surviving every checkout path.
+      - name: Source and secret checks
+        run: bash scripts/ci-security-checks.sh
+
+      # Tracks failures in a variable rather than relying on set -e: the failing
+      # side of an `&&` list does not trip it, so a broken script anywhere but
+      # last in the glob would otherwise pass silently.
+      - name: Shell scripts parse
+        run: |
+          STATUS=0
+          for f in scripts/*.sh; do
+            if bash -n "$f"; then
+              echo "ok  $f"
+            else
+              echo "::error::$f has a syntax error"
+              STATUS=1
+            fi
+          done
+          exit "$STATUS"
+
+  backend-tests:
+    name: Test ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [auth-service, post-service, user-service]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: services/${{ matrix.service }}/package-lock.json
+
+      # npm ci fails outright if package.json and the lockfile disagree.
+      - name: Install from lockfile
+        working-directory: services/${{ matrix.service }}
+        run: npm ci
+
+      # npm ci must not rewrite the lockfile; if it did, the install is not
+      # reproducible and the committed lockfile is stale.
+      - name: Lockfile is reproducible
+        run: git diff --exit-code -- services/${{ matrix.service }}/package-lock.json
+
+      - name: Run tests
+        working-directory: services/${{ matrix.service }}
+        run: npm test
+
+  api-gateway:
+    name: Check api-gateway
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: services/api-gateway/package-lock.json
+
+      - name: Install from lockfile
+        working-directory: services/api-gateway
+        run: npm ci
+
+      - name: Lockfile is reproducible
+        run: git diff --exit-code -- services/api-gateway/package-lock.json
+
+      # api-gateway ships no test or lint script. Rather than a suppressed
+      # command that always "succeeds", verify the module actually parses and
+      # its imports resolve. Its runtime behaviour is covered by the health
+      # check in stack-integration.
+      - name: Module parses and imports resolve
+        working-directory: services/api-gateway
+        # Non-secret routing config. The gateway builds its proxy middleware at
+        # module scope and throws if a target is undefined, so these must be
+        # present for it to boot at all -- mirroring what Compose supplies.
+        env:
+          AUTH_SERVICE_URL: http://localhost:3001
+          USER_SERVICE_URL: http://localhost:3002
+          POST_SERVICE_URL: http://localhost:3003
+          PORT: '5000'
+        run: |
+          set -uo pipefail
+          node --check server.js
+          echo "ok  server.js parses"
+
+          # Start it for real: an unresolved import or a throw at module scope
+          # exits immediately, so "still alive after a few seconds" is the
+          # signal. Checking liveness rather than killing-then-echoing is what
+          # makes this step able to fail.
+          node server.js > /tmp/gateway.log 2>&1 &
+          PID=$!
+          sleep 5
+
+          if kill -0 "$PID" 2>/dev/null; then
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+            echo "ok  api-gateway started; imports resolved"
+            cat /tmp/gateway.log
+          else
+            wait "$PID"; STATUS=$?
+            echo "::error::api-gateway exited during startup (status ${STATUS})"
+            cat /tmp/gateway.log
+            exit 1
+          fi
+
+  scripts-check:
+    name: Check migration script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install from lockfile
+        working-directory: .
+        run: npm ci
+
+      - name: Lockfile is reproducible
+        run: git diff --exit-code -- package-lock.json
+
+      - name: Script parses
+        run: node --check scripts/migrate-base64-images.js
+
+      # The migration touches real data, so it must refuse to run rather than
+      # guess at a database when its configuration is absent.
+      - name: Refuses to run without configuration
+        run: |
+          if node scripts/migrate-base64-images.js; then
+            echo "::error::migration script ran without required env vars"
+            exit 1
+          fi
+          echo "migration script correctly refused to run unconfigured"
+
+  frontend:
+    name: Frontend lint, build, bundle scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: social-media-mini-frontend/package-lock.json
+
+      - name: Install from lockfile
+        working-directory: social-media-mini-frontend
+        run: npm ci
+
+      - name: Lockfile is reproducible
+        run: git diff --exit-code -- social-media-mini-frontend/package-lock.json
+
+      - name: ESLint
+        working-directory: social-media-mini-frontend
+        run: npm run lint
+
+      - name: Production build
+        working-directory: social-media-mini-frontend
+        run: npm run build
+
+      # The service-role key is backend-only. The frontend reads no environment
+      # variables at all, and this proves none leaked into the shipped bundle.
+      - name: Bundle contains no backend secrets
+        run: bash scripts/ci-security-checks.sh bundle social-media-mini-frontend/dist
+
+      # dist/ only; never the workspace root, which holds a local .env.
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: social-media-mini-frontend/dist
+          retention-days: 7
+
+  compose-config:
+    name: Validate Compose files
+    runs-on: ubuntu-latest
+    env:
+      # Interpolation placeholders only. Nothing starts or connects here, so
+      # these need only be non-empty for `config` to resolve without warnings.
+      SUPABASE_URL: https://ci-placeholder.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ci-placeholder-not-a-real-key
+      SUPABASE_STORAGE_BUCKET: uploads
+      JWT_SECRET: ci-placeholder-config-validation-only
+      MONGO_ROOT_PASSWORD: ci-placeholder-config-validation-only
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose file parses
+        run: |
+          docker compose -f docker-compose.microservices.yml config >/dev/null
+          echo "ok  docker-compose.microservices.yml"
+
+      - name: Supabase config reaches only post-service and user-service
+        run: |
+          docker compose -f docker-compose.microservices.yml config \
+            --format json > /tmp/compose.json
+
+          python3 - <<'PY'
+          import json, sys
+
+          cfg = json.load(open('/tmp/compose.json'))
+          services = cfg.get('services', {})
+          expected = {'post-service', 'user-service'}
+          required = {
+              'SUPABASE_URL',
+              'SUPABASE_SERVICE_ROLE_KEY',
+              'SUPABASE_STORAGE_BUCKET',
+          }
+          failures = []
+
+          holders = set()
+          for name, spec in services.items():
+              env = spec.get('environment') or {}
+              keys = set(env) if isinstance(env, dict) else {
+                  e.split('=', 1)[0] for e in env if '=' in e
+              }
+              if any(k.startswith('SUPABASE') for k in keys):
+                  holders.add(name)
+              if name in ('frontend', 'api-gateway'):
+                  leaked = {k for k in keys if k.startswith('SUPABASE') or 'JWT' in k}
+                  if leaked:
+                      failures.append(f'{name} must not receive {sorted(leaked)}')
+              # Both upload services need the complete set; a partial set means
+              # uploads fail at run time rather than at deploy time.
+              if name in expected:
+                  absent = required - keys
+                  if absent:
+                      failures.append(f'{name} is missing {sorted(absent)}')
+
+          if holders != expected:
+              failures.append(
+                  f'Supabase vars expected on {sorted(expected)}, found on {sorted(holders)}'
+              )
+
+          # The replaced local-disk implementation mounted upload volumes.
+          for name, spec in services.items():
+              for vol in spec.get('volumes') or []:
+                  target = vol.get('target', '') if isinstance(vol, dict) else str(vol)
+                  if 'upload' in target.lower():
+                      failures.append(f'{name} still mounts an upload volume: {target}')
+
+          for f in failures:
+              print(f'::error::{f}')
+          if failures:
+              sys.exit(1)
+
+          print(f'Supabase config confined to {sorted(holders)}')
+          print('No upload volumes; frontend and api-gateway hold no backend secrets')
+          PY
+
+  docker-build:
+    name: Build image ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    needs: [security-checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { path: services/auth-service,       name: auth-service }
+          - { path: services/post-service,       name: post-service }
+          - { path: services/user-service,       name: user-service }
+          - { path: services/api-gateway,        name: api-gateway }
+          - { path: social-media-mini-frontend,  name: frontend }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.path }}
+          push: false
+          tags: ${{ matrix.name }}:ci
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  stack-integration:
+    name: Boot microservices stack
+    runs-on: ubuntu-latest
+    needs: [compose-config, backend-tests]
+    timeout-minutes: 25
+    # Job-level, not per-step: Compose re-reads and re-interpolates the file on
+    # every invocation, so `ps`, `logs`, `exec` and `down` need these too.
+    # Without them those commands warn that the variables are unset and compute
+    # a config that no longer matches the running containers.
+    #
+    # Deliberately non-functional values. They exercise the configured
+    # client-construction path without reaching Supabase, which is why no upload
+    # round-trip is asserted below.
+    env:
+      SUPABASE_URL: https://ci-placeholder.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ci-placeholder-not-a-real-key
+      SUPABASE_STORAGE_BUCKET: uploads
+    steps:
+      - uses: actions/checkout@v4
+
+      # Generated per run and masked, so no secret is stored in the repository
+      # or recoverable from the logs. auth-service exits unless this is set.
+      # MONGO_ROOT_PASSWORD has no Compose default, by design: an unset value must
+      # fail visibly rather than fall back to a well-known one. CI has no .env,
+      # so it has to supply the value itself. Without it the mongo image refuses
+      # to initialise (username set, password empty) and the whole stack aborts
+      # on `dependency failed to start: container social-media-mongodb is
+      # unhealthy`.
+      #
+      # hex output matters: the password is interpolated into a MongoDB
+      # connection URI without percent-encoding, so it must not contain
+      # @ : / ? # or %.
+      - name: Generate throwaway stack secrets
+        run: |
+          JWT="$(openssl rand -hex 32)"
+          MONGO_PW="$(openssl rand -hex 24)"
+          echo "::add-mask::$JWT"
+          echo "::add-mask::$MONGO_PW"
+          echo "JWT_SECRET=$JWT" >> "$GITHUB_ENV"
+          echo "MONGO_ROOT_PASSWORD=$MONGO_PW" >> "$GITHUB_ENV"
+
+      # Building separately keeps an image build failure from being mistaken for
+      # a health failure in the step that follows.
+      - name: Build stack images
+        run: docker compose -f docker-compose.microservices.yml build
+
+      - name: Start stack
+        run: |
+          docker compose -f docker-compose.microservices.yml up -d --wait
+          echo "stack reported healthy"
+
+      - name: Container status
+        run: docker compose -f docker-compose.microservices.yml ps
+
+      # Probed over the Docker network rather than from the host, because only
+      # the frontend publishes a port. These checks are also a closer match to
+      # production than host curls were: addressing the services by Compose
+      # service name from inside api-gateway is exactly the path the gateway
+      # uses at runtime, so a DNS or network regression fails here too.
+      #
+      # wget rather than curl: the Node images are node:22-alpine, whose BusyBox
+      # wget is already what the container healthchecks use.
+      - name: Service health endpoints respond over the Docker network
+        run: |
+          set -euo pipefail
+          C="docker compose -f docker-compose.microservices.yml"
+
+          # $1 label, $2 container to probe FROM, $3 URL to request
+          check() {
+            local name="$1" from="$2" url="$3"
+            for attempt in $(seq 1 30); do
+              if body=$($C exec -T "$from" wget -q -O - "$url" 2>/dev/null); then
+                echo "ok  $name -> $body"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$name did not respond at $url (probed from $from)"
+            return 1
+          }
+
+          # The three services, reached by service name from the gateway.
+          check auth-service api-gateway http://auth-service:3001/health
+          check user-service api-gateway http://user-service:3002/health
+          check post-service api-gateway http://post-service:3003/health
+
+          # The gateway itself, on its own port inside its own container.
+          check api-gateway  api-gateway http://localhost:5000/health
+
+      # End-to-end through the one published port: nginx -> api-gateway -> all
+      # three services. Returns 200 only when every backend is healthy, so it
+      # verifies the public request path that users actually take.
+      - name: Aggregate health through nginx
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if body=$(curl -fsS --max-time 5 http://localhost/api/health/all 2>/dev/null); then
+              echo "ok  /api/health/all -> $body"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::/api/health/all did not return 200 through nginx"
+          exit 1
+
+      - name: Frontend serves over nginx
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 5 -o /dev/null http://localhost:80/; then
+              echo "ok  frontend responds on :80"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::frontend did not serve on port 80"
+          exit 1
+
+      - name: Redis and MongoDB reachable
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.microservices.yml exec -T redis \
+            redis-cli ping | grep -q PONG
+          echo "ok  redis responds to PING"
+          docker compose -f docker-compose.microservices.yml exec -T mongodb \
+            mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep -q 1
+          echo "ok  mongodb responds to ping"
+
+      # The health endpoints prove the processes are up; these assertions prove
+      # each application actually established its backing connections.
+      - name: Applications connected to MongoDB and Redis
+        run: |
+          set -euo pipefail
+          for svc in auth-service user-service post-service; do
+            logs=$(docker compose -f docker-compose.microservices.yml logs "$svc")
+            for dep in "MongoDB Connected" "Redis Connected"; do
+              if printf '%s' "$logs" | grep -q "$dep"; then
+                echo "ok  $svc -> $dep"
+              else
+                echo "::error::$svc never reported: $dep"
+                exit 1
+              fi
+            done
+          done
+
+      # Confirms the Supabase branch was taken rather than the
+      # not-configured fallback, so the client construction path is exercised.
+      - name: Supabase client initialised in upload services
+        run: |
+          set -euo pipefail
+          for svc in post-service user-service; do
+            if docker compose -f docker-compose.microservices.yml logs "$svc" \
+                | grep -q "Supabase credentials not set"; then
+              echo "::error::$svc did not receive Supabase configuration"
+              exit 1
+            fi
+            echo "ok  $svc initialised its Supabase client"
+          done
+
+      # Runs on failure of ANY preceding step, including `up --wait` aborting
+      # because a dependency never became healthy -- the case where no service
+      # logs were previously captured at all.
+      #
+      # Every probe is individually tolerant of a missing or never-created
+      # container so that one absent service cannot cut the report short. That
+      # cannot mask the build/startup failure: this step only reports, and the
+      # step that actually failed has already marked the job failed.
+      - name: Diagnostics
+        if: failure()
+        run: |
+          C="docker compose -f docker-compose.microservices.yml"
+
+          probe() {
+            local title="$1"; shift
+            echo "::group::${title}"
+            "$@" 2>&1 || echo "[diagnostic command returned non-zero: $*]"
+            echo "::endgroup::"
+          }
+
+          # 1. Container status, including containers that exited or were never
+          #    started (plain `ps` hides those).
+          probe "1. docker compose ps -a" $C ps -a
+
+          # 2-5. Full logs per application service. No --tail: a crash loop puts
+          #      the useful error at the start of the output, not the end.
+          for svc in user-service auth-service post-service api-gateway; do
+            probe "logs: ${svc}" $C logs --no-color "$svc"
+          done
+
+          # 6. Backing services.
+          for svc in mongodb redis elasticsearch; do
+            probe "logs: ${svc}" $C logs --no-color --tail=100 "$svc"
+          done
+
+          # 7. Health-check detail for user-service. State.Health.Log holds each
+          #    probe's exit code and output -- the actual reason wget failed --
+          #    and OOMKilled/ExitCode distinguish a crash from a failed probe.
+          echo "::group::7. user-service container state and health probe log"
+          CID="$($C ps -aq user-service 2>/dev/null || true)"
+          if [ -n "$CID" ]; then
+            docker inspect "$CID" \
+              --format '{{json (index .State)}}' 2>&1 | python3 -m json.tool || true
+            echo "--- health probe attempts ---"
+            docker inspect "$CID" \
+              --format '{{range .State.Health.Log}}exit={{.ExitCode}} start={{.Start}}{{"\n"}}output: {{.Output}}{{"\n"}}---{{"\n"}}{{end}}' 2>&1 || true
+            echo "--- effective healthcheck config ---"
+            docker inspect "$CID" --format '{{json .Config.Healthcheck}}' 2>&1 || true
+          else
+            echo "no user-service container exists (it was never created)"
+          fi
+          echo "::endgroup::"
+
+          # Resource pressure: an OOM kill of any container shows up here and is
+          # a plausible cause when Elasticsearch shares a 7GB runner.
+          probe "runner resources" free -h
+          probe "docker disk usage" docker system df
+
+          echo "Diagnostics complete. The failing step above is the real failure."
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.microservices.yml down -v --remove-orphans
+
+  ci-complete:
+    name: CI complete
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - security-checks
+      - backend-tests
+      - api-gateway
+      - scripts-check
+      - frontend
+      - compose-config
+      - docker-build
+      - stack-integration
+    steps:
+      # A skipped or failed dependency must not read as a green pipeline.
+      - name: Verify no job failed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] \
+          || [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "::error::one or more CI jobs did not succeed"
+            exit 1
+          fi
+          echo "all CI jobs succeeded"
